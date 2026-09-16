@@ -4,298 +4,514 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const SECRET = process.env.BRIDGE_SECRET || "";
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET || "";
 
 const queue = [];
-let lastPoll = 0;
+let nextId = 1;
 
-function authorized(req) {
-  const headerSecret = req.get("x-bridge-secret");
-  const querySecret = req.query.secret;
+const toolResult = (text) => ({
+  content: [{ type: "text", text }],
+});
 
-  if (!SECRET) return true;
-  return headerSecret === SECRET || querySecret === SECRET;
+function checkAuth(req) {
+  const secret = req.headers["x-bridge-secret"] || req.query.secret || "";
+  return !BRIDGE_SECRET || secret === BRIDGE_SECRET;
 }
 
 function enqueue(command) {
-  queue.push(command);
-  if (queue.length > 50) queue.shift();
+  queue.push({
+    id: nextId++,
+    ...command,
+    createdAt: Date.now(),
+  });
+
+  // 防止极端情况下队列无限增长
+  while (queue.length > 100) queue.shift();
+
+  return queue[queue.length - 1];
 }
 
 app.get("/", (req, res) => {
   res.json({
-    ok: true,
-    service: "svakom-bridge",
+    name: "svakom-ble-ai bridge",
+    status: "online",
     mcp: "/mcp",
-    poll: "/toy-next"
+    next: "/toy-next",
+    health: "/health",
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    service: "svakom-ble-ai",
+  });
 });
 
 app.get("/toy-next", (req, res) => {
-  if (!authorized(req)) {
-    return res.status(401).json({ error: "unauthorized" });
+  if (!checkAuth(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
-
-  lastPoll = Date.now();
 
   const command = queue.shift();
 
   if (!command) {
-    return res.json({ type: "hello", online: true });
+    return res.json({ type: "hello" });
   }
 
   res.json(command);
 });
 
-/*
- * Minimal MCP HTTP endpoint.
- * Supports:
- *   initialize
- *   tools/list
- *   tools/call
- */
-app.post("/mcp", (req, res) => {
-  if (!authorized(req)) {
+function listTools() {
+  return [
+    {
+      name: "toy_status",
+      description:
+        "检查 Windows BLE bridge 是否在线并正在轮询 Railway。",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_set_speed",
+      description:
+        "兼容旧版：设置设备总强度。speed 使用 0 到 1，sec 为持续秒数。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          speed: {
+            type: "number",
+            description: "总强度，0 到 1",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数；建议填写",
+          },
+        },
+        required: ["speed"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_set_pattern",
+      description:
+        "兼容旧版：设置震动模式。现在支持模式 1 到 10、强度 1 到 10。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          pattern: {
+            type: "integer",
+            description: "震动模式 1 到 10",
+          },
+          level: {
+            type: "integer",
+            description: "震动强度 1 到 10",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数",
+          },
+        },
+        required: ["pattern", "level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_vibrate",
+      description:
+        "设置震动：模式 1 到 10，强度 1 到 10，可指定持续秒数。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "integer",
+            description: "模式 1 到 10",
+          },
+          level: {
+            type: "integer",
+            description: "强度 1 到 10",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数",
+          },
+        },
+        required: ["mode", "level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_auto",
+      description:
+        "设置自动模式总强度。强度 0 到 255，可指定持续秒数。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          level: {
+            type: "integer",
+            description: "总强度 0 到 255",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数",
+          },
+        },
+        required: ["level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_patting",
+      description:
+        "设置拍打档位 1 到 7，可指定持续秒数。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          level: {
+            type: "integer",
+            description: "拍打档位 1 到 7",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数",
+          },
+        },
+        required: ["level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_thrust",
+      description:
+        "设置伸缩档位 1 到 7，可指定持续秒数。只有档位，没有独立强度。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          level: {
+            type: "integer",
+            description: "伸缩档位 1 到 7",
+          },
+          sec: {
+            type: "number",
+            description: "持续秒数",
+          },
+        },
+        required: ["level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_heat",
+      description:
+        "设置加热温度（摄氏度）并强制要求持续秒数。必须由客户端负责自动停止。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          temp: {
+            type: "integer",
+            description: "温度，单位摄氏度",
+          },
+          sec: {
+            type: "number",
+            description: "必须填写，持续秒数",
+          },
+        },
+        required: ["temp", "sec"],
+        additionalProperties: false,
+      },
+    },
+
+    {
+      name: "toy_stop",
+      description:
+        "停止设备。channel 可选 all、vibrate、auto、patting、thrust、heat。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel: {
+            type: "string",
+            description:
+              "停止目标：all / vibrate / auto / patting / thrust / heat",
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+async function callTool(name, args = {}) {
+  switch (name) {
+    case "toy_status":
+      return toolResult("BLE bridge is online and polling.");
+
+    case "toy_set_speed": {
+      let speed = Number(args.speed ?? 0);
+      let sec = args.sec;
+
+      if (!Number.isFinite(speed)) speed = 0;
+      speed = Math.max(0, Math.min(1, speed));
+
+      // 兼容旧工具：映射到 0x04 自动模式
+      const level = Math.round(speed * 255);
+
+      enqueue({
+        type: level <= 0 ? "stop" : "auto",
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Auto mode queued: ${Math.round(speed * 100)}%` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_set_pattern": {
+      const mode = Math.max(1, Math.min(10, Number(args.pattern)));
+      const level = Math.max(1, Math.min(10, Number(args.level)));
+      const sec = args.sec;
+
+      enqueue({
+        type: "vibrate",
+        mode,
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Vibration queued: mode ${mode}, level ${level}/10` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_vibrate": {
+      const mode = Math.max(1, Math.min(10, Number(args.mode)));
+      const level = Math.max(1, Math.min(10, Number(args.level)));
+      const sec = args.sec;
+
+      enqueue({
+        type: "vibrate",
+        mode,
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Vibration queued: mode ${mode}, level ${level}/10` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_auto": {
+      const level = Math.max(0, Math.min(255, Number(args.level)));
+      const sec = args.sec;
+
+      if (level <= 0) {
+        enqueue({
+          type: "stop",
+          channel: "auto",
+        });
+
+        return toolResult("Auto mode stop queued.");
+      }
+
+      enqueue({
+        type: "auto",
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Auto mode queued: ${Math.round((level / 255) * 100)}%` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_patting": {
+      const level = Math.max(1, Math.min(7, Number(args.level)));
+      const sec = args.sec;
+
+      enqueue({
+        type: "patting",
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Patting queued: level ${level}/7` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_thrust": {
+      const level = Math.max(1, Math.min(7, Number(args.level)));
+      const sec = args.sec;
+
+      enqueue({
+        type: "thrust",
+        level,
+        sec,
+      });
+
+      return toolResult(
+        `Thrust queued: level ${level}/7` +
+          (sec != null ? ` for ${sec}s.` : ".")
+      );
+    }
+
+    case "toy_heat": {
+      const temp = Math.max(1, Math.min(55, Number(args.temp)));
+      const sec = Number(args.sec);
+
+      if (!Number.isFinite(sec) || sec <= 0) {
+        throw new Error("toy_heat requires a positive sec value.");
+      }
+
+      enqueue({
+        type: "heat",
+        temp,
+        sec,
+      });
+
+      return toolResult(
+        `Heating queued: ${temp}°C for ${sec}s.`
+      );
+    }
+
+    case "toy_stop": {
+      const channel = args.channel || "all";
+
+      const valid = [
+        "all",
+        "vibrate",
+        "auto",
+        "patting",
+        "thrust",
+        "heat",
+      ];
+
+      if (!valid.includes(channel)) {
+        throw new Error(`Invalid channel: ${channel}`);
+      }
+
+      enqueue({
+        type: "stop",
+        channel,
+      });
+
+      return toolResult(`Stop command queued: ${channel}.`);
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+app.post("/mcp", async (req, res) => {
+  if (!checkAuth(req)) {
     return res.status(401).json({
       jsonrpc: "2.0",
+      id: req.body?.id ?? null,
       error: {
         code: -32001,
-        message: "Unauthorized"
+        message: "Unauthorized",
       },
-      id: req.body?.id ?? null
     });
   }
 
-  const msg = req.body || {};
-  const id = msg.id ?? null;
+  const body = req.body || {};
+  const id = body.id ?? null;
+  const method = body.method;
+  const params = body.params || {};
 
-  if (msg.method === "initialize") {
-    return res.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        protocolVersion: "2024-11-05",
-        capabilities: {
-          tools: {}
+  try {
+    if (method === "initialize") {
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2025-03-26",
+          capabilities: {
+            tools: {},
+          },
+          serverInfo: {
+            name: "svakom-ble-ai",
+            version: "2.0.0",
+          },
         },
-        serverInfo: {
-          name: "svakom-bridge",
-          version: "1.0.0"
-        }
-      }
-    });
-  }
-
-  if (msg.method === "notifications/initialized") {
-    return res.status(202).end();
-  }
-
-  if (msg.method === "tools/list") {
-    return res.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: [
-          {
-            name: "toy_set_speed",
-            description: "Set device intensity from 0.0 to 1.0.",
-            inputSchema: {
-              type: "object",
-              properties: {
-                speed: {
-                  type: "number",
-                  minimum: 0,
-                  maximum: 1
-                },
-                sec: {
-                  type: "number",
-                  minimum: 0
-                }
-              },
-              required: ["speed"]
-            }
-          },
-          {
-            name: "toy_set_pattern",
-            description: "Set vibration pattern.",
-            inputSchema: {
-              type: "object",
-              properties: {
-                pattern: {
-                  type: "integer",
-                  minimum: 1,
-                  maximum: 8
-                },
-                level: {
-                  type: "number",
-                  minimum: 0,
-                  maximum: 1
-                },
-                sec: {
-                  type: "number",
-                  minimum: 0
-                }
-              },
-              required: ["pattern"]
-            }
-          },
-          {
-            name: "toy_stop",
-            description: "Stop the device immediately.",
-            inputSchema: {
-              type: "object",
-              properties: {}
-            }
-          },
-          {
-            name: "toy_status",
-            description: "Check whether the BLE bridge is polling this server.",
-            inputSchema: {
-              type: "object",
-              properties: {}
-            }
-          }
-        ]
-      }
-    });
-  }
-
-  if (msg.method === "tools/call") {
-    const name = msg.params?.name;
-    const args = msg.params?.arguments || {};
-
-    if (name === "toy_set_speed") {
-      const speed = Math.max(0, Math.min(1, Number(args.speed)));
-
-      if (!Number.isFinite(speed)) {
-        return res.json({
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32602,
-            message: "speed must be a number between 0 and 1"
-          }
-        });
-      }
-
-      enqueue({
-        speed,
-        ...(args.sec ? { sec: Number(args.sec) } : {})
       });
+    }
 
+    if (method === "notifications/initialized") {
+      return res.status(204).end();
+    }
+
+    if (method === "tools/list") {
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          content: [
-            {
-              type: "text",
-              text: `Queued speed ${Math.round(speed * 100)}%.`
-            }
-          ]
-        }
+          tools: listTools(),
+        },
       });
     }
 
-    if (name === "toy_set_pattern") {
-      const pattern = Number(args.pattern);
-      const level =
-        args.level === undefined
-          ? 0.6
-          : Math.max(0, Math.min(1, Number(args.level)));
+    if (method === "tools/call") {
+      const name = params.name;
+      const args = params.arguments || {};
 
-      if (!Number.isInteger(pattern) || pattern < 1 || pattern > 8) {
-        return res.json({
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32602,
-            message: "pattern must be an integer from 1 to 8"
-          }
-        });
-      }
-
-      enqueue({
-        pattern,
-        level,
-        ...(args.sec ? { sec: Number(args.sec) } : {})
-      });
+      const result = await callTool(name, args);
 
       return res.json({
         jsonrpc: "2.0",
         id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: `Queued pattern ${pattern}.`
-            }
-          ]
-        }
+        result,
       });
     }
 
-    if (name === "toy_stop") {
-      enqueue({ stop: true });
-
+    if (method === "ping") {
       return res.json({
         jsonrpc: "2.0",
         id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: "Stop command queued."
-            }
-          ]
-        }
+        result: {},
       });
     }
 
-    if (name === "toy_status") {
-      const online =
-        lastPoll > 0 && Date.now() - lastPoll < 5000;
-
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: online
-                ? "BLE bridge is online and polling."
-                : "BLE bridge is offline or not polling."
-            }
-          ]
-        }
-      });
-    }
-
-    return res.json({
+    return res.status(400).json({
       jsonrpc: "2.0",
       id,
       error: {
         code: -32601,
-        message: `Unknown tool: ${name}`
-      }
+        message: `Method not found: ${method}`,
+      },
+    });
+  } catch (err) {
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: err?.message || String(err),
+          },
+        ],
+      },
     });
   }
-
-  return res.json({
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code: -32601,
-      message: `Unknown method: ${msg.method}`
-    }
-  });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`svakom-bridge listening on ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`svakom-ble-ai MCP server listening on ${PORT}`);
 });
