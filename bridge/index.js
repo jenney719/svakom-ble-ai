@@ -210,6 +210,22 @@ function listTools() {
     },
 
     {
+      name: "toy_suction",
+      description:
+        "控制吮吸头，使用独立 0x09 通道。mode 为 1 到 5（默认 1），level 为 0 到 10，0 只停止吮吸；建议指定 sec。机身与吮吸头先开机联动，一个 BLE bridge 连接 SL278H 即可。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: { type: "integer", minimum: 1, maximum: 5, default: 1, description: "吮吸模式；已实测模式 1" },
+          level: { type: "integer", minimum: 0, maximum: 10, description: "吮吸强度；0 只停止吮吸，首次从 1 开始" },
+          sec: { type: "number", exclusiveMinimum: 0, description: "持续秒数；建议填写，蓝牙桥到时单独停止吮吸" },
+        },
+        required: ["level"],
+        additionalProperties: false,
+      },
+    },
+
+    {
       name: "toy_heat",
       description:
         "设置加热温度（摄氏度）并强制要求持续秒数。必须由客户端负责自动停止。",
@@ -233,14 +249,14 @@ function listTools() {
     {
       name: "toy_stop",
       description:
-        "停止设备。channel 可选 all、vibrate、auto、patting、thrust、heat。",
+        "停止设备。channel 可选 all、vibrate、auto、patting、thrust、suction、heat；suction 只停止吮吸，all 停止所有通道。",
       inputSchema: {
         type: "object",
         properties: {
           channel: {
             type: "string",
             description:
-              "停止目标：all / vibrate / auto / patting / thrust / heat",
+              "停止目标：all / vibrate / auto / patting / thrust / suction / heat",
           },
         },
         additionalProperties: false,
@@ -369,6 +385,26 @@ async function callTool(name, args = {}) {
       );
     }
 
+    case "toy_suction": {
+      const mode = args.mode ?? 1;
+      const level = args.level;
+      const sec = args.sec;
+      if (!Number.isInteger(mode) || mode < 1 || mode > 5 ||
+          !Number.isInteger(level) || level < 0 || level > 10) {
+        throw new Error("toy_suction requires mode 1–5 and level 0–10 (integers).");
+      }
+      if (sec != null && (typeof sec !== "number" || !Number.isFinite(sec) || sec <= 0)) {
+        throw new Error("toy_suction requires a positive finite sec value when provided.");
+      }
+      if (level === 0) {
+        enqueue({ type: "stop", channel: "suction" });
+        return toolResult("Suction stop queued.");
+      }
+      enqueue({ type: "suction", mode, level, sec });
+      return toolResult(`Suction queued: mode ${mode}, level ${level}/10` +
+        (sec != null ? ` for ${sec}s.` : "."));
+    }
+
     case "toy_heat": {
       const temp = Math.max(1, Math.min(55, Number(args.temp)));
       const sec = Number(args.sec);
@@ -397,6 +433,7 @@ async function callTool(name, args = {}) {
         "auto",
         "patting",
         "thrust",
+        "suction",
         "heat",
       ];
 
@@ -446,7 +483,7 @@ app.post("/mcp", async (req, res) => {
           },
           serverInfo: {
             name: "svakom-ble-ai",
-            version: "2.0.0",
+            version: "2.1.0",
           },
         },
       });
