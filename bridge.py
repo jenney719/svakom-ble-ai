@@ -23,11 +23,16 @@ WRITE_TIMEOUT_SEC = 5
 
 client_ref = None
 connection_generation = 0
+synced_generation = -1
+batch_applying = False
+server_instance = None
+last_command_id = 0
 connection_fault = None
 connected_device_name = None
 last_notification_at = 0.0
 notification_count = 0
 write_lock = asyncio.Lock()
+flush_lock = asyncio.Lock()
 channel_tasks = {}
 active = {
     "vibrate": None,
@@ -37,6 +42,8 @@ active = {
     "thrust": None,
     "heat": None,
 }
+channel_revisions = {channel: 0 for channel in active}
+dirty_channels = set()
 
 logger = logging.getLogger("svakom.bridge")
 
@@ -65,21 +72,18 @@ def log(s):
 
 
 def clear_active_channels():
-    current = asyncio.current_task()
     for channel in active:
-        task = channel_tasks.get(channel)
-        if task and task is not current:
-            task.cancel()
-        channel_tasks[channel] = None
-        active[channel] = None
+        remember_channel(channel, None)
 
 
 def invalidate_connection(expected_client):
-    global client_ref, connection_generation
+    global client_ref, connection_generation, synced_generation
     if client_ref is expected_client and expected_client is not None:
         client_ref = None
         connection_generation += 1
-        clear_active_channels()
+        synced_generation = -1
+        # 保留目标状态和原截止时间；重连并同步云端后再恢复。
+        dirty_channels.update(active)
         if connection_fault is not None:
             connection_fault.set()
 
@@ -167,223 +171,209 @@ def frame_05_stop():
     return bytes([0x55, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00])
 
 
-async def write(buf, active_channel=None):
+def valid_duration(sec):
+    if sec is None:
+        return None
+    sec = float(sec)
+    if not math.isfinite(sec) or sec <= 0:
+        raise ValueError("sec 必须是有限正数")
+    return sec
+
+
+def remember_channel(channel, parameters, sec=None):
+    duration = valid_duration(sec)
+    previous = channel_tasks.get(channel)
+    if previous and previous is not asyncio.current_task():
+        previous.cancel()
+    channel_tasks[channel] = None
+    channel_revisions[channel] += 1
+    dirty_channels.add(channel)
+    if parameters is None:
+        active[channel] = None
+        return
+    deadline = time.monotonic() + duration if duration is not None else None
+    active[channel] = {**parameters, "deadline": deadline}
+    if deadline is not None:
+        channel_tasks[channel] = asyncio.create_task(
+            timed_stop(channel, deadline, channel_revisions[channel]))
+
+
+def expire_due_channels():
+    now = time.monotonic()
+    for channel, state in active.items():
+        if state and state.get("deadline") is not None and state["deadline"] <= now:
+            remember_channel(channel, None)
+            log(f"⏱ {channel} 已到原截止时间，取消恢复")
+
+
+def can_start_output():
+    return bool(client_ref and client_ref.is_connected and not batch_applying
+                and synced_generation == connection_generation)
+
+
+def channel_frame(channel, state):
+    if state is None:
+        return {"vibrate": frame_03_stop, "auto": frame_04_stop,
+                "patting": frame_07_stop, "thrust": frame_08_stop,
+                "suction": frame_09_stop, "heat": frame_05_stop}[channel]()
+    if channel == "vibrate":
+        return frame_03(state["mode"], state["level"])
+    if channel == "auto":
+        return frame_04(state["level"])
+    if channel == "patting":
+        return frame_07(state["level"])
+    if channel == "thrust":
+        return frame_08(state["level"])
+    if channel == "suction":
+        return frame_09(state["mode"], state["level"])
+    return frame_05(state["temp"])
+
+
+async def write(buf, active_channel=None, expected_revision=None):
     async with write_lock:
-        if active_channel and not active[active_channel]:
-            return
+        if active_channel:
+            expire_due_channels()
+            if (not can_start_output() or not active[active_channel]
+                    or (expected_revision is not None
+                        and channel_revisions[active_channel] != expected_revision)):
+                return False
         transport = client_ref
         if not transport or not transport.is_connected:
-            raise ConnectionError("BLE 未连接，未发送指令")
+            raise ConnectionError("BLE 未连接，指令状态已保留")
         try:
             await asyncio.wait_for(
                 transport.write_gatt_char(WRITE_UUID, buf, response=False), WRITE_TIMEOUT_SEC)
             await asyncio.sleep(FRAME_GAP_SEC)
+            return True
         except Exception as error:
             log(f"❌ BLE 写入失败 CMD=0x{buf[1]:02X}：{type(error).__name__}: {error!r}")
             invalidate_connection(transport)
-            raise ConnectionError("BLE 写入失败，已清理运行状态并请求重连") from error
+            raise ConnectionError("BLE 写入失败，保留有效状态并请求重连") from error
+
+
+async def flush_dirty_channels():
+    if batch_applying:
+        return
+    async with flush_lock:
+        while client_ref and client_ref.is_connected and not batch_applying:
+            expire_due_channels()
+            # 先发停止，再恢复动作；同步完成前绝不发启动帧。
+            stopped = [ch for ch in active if ch in dirty_channels and active[ch] is None]
+            running = ([ch for ch in active if ch in dirty_channels and active[ch] is not None]
+                       if can_start_output() else [])
+            pending = stopped + running
+            if not pending:
+                break
+            for channel in pending:
+                state = active[channel]
+                revision = channel_revisions[channel]
+                generation = connection_generation
+                try:
+                    sent = await write(channel_frame(channel, state),
+                                       active_channel=channel if state else None,
+                                       expected_revision=revision)
+                except ConnectionError:
+                    return
+                if (sent and revision == channel_revisions[channel]
+                        and generation == connection_generation):
+                    dirty_channels.discard(channel)
 
 
 async def cancel_channel(channel, send_stop=True):
-    task = channel_tasks.get(channel)
-    if task:
-        # 到时停止任务不能取消自己，否则停止帧可能在等待写锁时被取消。
-        if task is not asyncio.current_task():
-            task.cancel()
-        channel_tasks[channel] = None
-
-    active[channel] = None
-
+    remember_channel(channel, None)
     if send_stop:
-        if channel == "vibrate":
-            await write(frame_03_stop())
-        elif channel == "auto":
-            await write(frame_04_stop())
-        elif channel == "patting":
-            await write(frame_07_stop())
-        elif channel == "suction":
-            await write(frame_09_stop())
-        elif channel == "thrust":
-            await write(frame_08_stop())
-        elif channel == "heat":
-            await write(frame_05_stop())
+        await flush_dirty_channels()
 
 
-async def timed_stop(channel, sec):
+async def timed_stop(channel, deadline, revision):
     try:
-        await asyncio.sleep(float(sec))
-        await cancel_channel(channel, send_stop=True)
-        log(f"⏱ {channel} 到时自动停")
+        await asyncio.sleep(max(0, deadline - time.monotonic()))
+        if channel_revisions[channel] != revision:
+            return
+        await cancel_channel(channel)
+        log(f"⏱ {channel} 到时停止；离线时保留停止状态，重连后也不恢复")
     except asyncio.CancelledError:
         pass
-    except ConnectionError as error:
-        log(f"⚠️ {channel} 到时停止未送达：{error}；连接已转入重连流程")
-
-
-def set_timer(channel, sec):
-    task = channel_tasks.get(channel)
-    if task:
-        task.cancel()
-
-    channel_tasks[channel] = None
-
-    if sec is not None:
-        sec = float(sec)
-        if sec > 0:
-            channel_tasks[channel] = asyncio.create_task(timed_stop(channel, sec))
 
 
 async def start_vibrate(mode, level, sec=None):
-    # 0x03 与 0x04 共用一个马达，切换前显式停另一条
-    await cancel_channel("auto", send_stop=True)
-
-    active["vibrate"] = {
-        "mode": mode,
-        "level": level,
-    }
-
-    await write(frame_03(mode, level))
-    set_timer("vibrate", sec)
-    log(f"🌀 震动：模式 {mode} / 强度 {level}/10")
+    valid_duration(sec)
+    remember_channel("auto", None)
+    remember_channel("vibrate", {"mode": mode, "level": level}, sec)
+    await flush_dirty_channels()
+    log(f"🌀 震动目标：模式 {mode} / 强度 {level}/10")
 
 
 async def start_auto(level, sec=None):
-    await cancel_channel("vibrate", send_stop=True)
-
-    active["auto"] = {"level": level}
-
-    await write(frame_04(level))
-    set_timer("auto", sec)
-    log(f"📳 自动模式：{round(level / 255 * 100)}%")
+    valid_duration(sec)
+    remember_channel("vibrate", None)
+    remember_channel("auto", {"level": level}, sec) if level > 0 else remember_channel("auto", None)
+    await flush_dirty_channels()
+    log(f"📳 自动模式目标：{round(level / 255 * 100)}%")
 
 
 async def start_patting(level, sec=None):
-    active["patting"] = {"level": level}
-    await write(frame_07(level))
-    set_timer("patting", sec)
-    log(f"👏 拍打：{level}/7")
+    remember_channel("patting", {"level": level}, sec)
+    await flush_dirty_channels()
+    log(f"👏 拍打目标：{level}/7")
 
 
 async def start_thrust(level, sec=None):
-    active["thrust"] = {"level": level}
-    await write(frame_08(level))
-    set_timer("thrust", sec)
-    log(f"↕ 伸缩：{level}/7")
+    remember_channel("thrust", {"level": level}, sec)
+    await flush_dirty_channels()
+    log(f"↕ 伸缩目标：{level}/7")
 
 
 async def start_suction(mode, level, sec=None):
     if not 1 <= mode <= 5 or not 0 <= level <= 10:
         raise ValueError("吮吸 mode 必须为 1–5，level 必须为 0–10")
-    if sec is not None:
-        sec = float(sec)
-        if not math.isfinite(sec) or sec <= 0:
-            raise ValueError("吮吸 sec 必须是正数")
-    await cancel_channel("suction", send_stop=False)
-    if level == 0:
-        await write(frame_09_stop())
-        log("⏹ 停止：suction")
-        return
-    active["suction"] = {"mode": mode, "level": level}
-    await write(frame_09(mode, level))
-    set_timer("suction", sec)
-    log(f"💨 吮吸：模式 {mode} / 强度 {level}/10")
+    valid_duration(sec)
+    remember_channel("suction", {"mode": mode, "level": level}, sec) if level else remember_channel("suction", None)
+    await flush_dirty_channels()
+    log(f"💨 吮吸目标：模式 {mode} / 强度 {level}/10")
 
 
 async def start_heat(temp, sec=None):
-    # 加热必须有封顶计时
-    if sec is None or float(sec) <= 0:
-        log("⚠️ 加热必须提供 sec，已拒绝")
-        return
-
-    temp = clamp(temp, 1, 55)
-    active["heat"] = {"temp": temp}
-
-    await write(frame_05(temp))
-    set_timer("heat", sec)
-    log(f"🔥 温度：{temp}°C / {sec}秒")
+    if sec is None:
+        raise ValueError("加热必须提供 sec")
+    remember_channel("heat", {"temp": clamp(temp, 1, 55)}, sec)
+    await flush_dirty_channels()
+    log(f"🔥 加热目标：{temp}°C / {sec}秒")
 
 
 async def stop_all():
-    for ch in list(active.keys()):
-        task = channel_tasks.get(ch)
-        if task:
-            task.cancel()
-            channel_tasks[ch] = None
-        active[ch] = None
-
-    # 联动转发需要留出间隔，每个通道发送各自的停止帧。
-    await write(frame_09_stop())
-    await write(frame_03_stop())
-    await write(frame_04_stop())
-    await write(frame_07_stop())
-    await write(frame_08_stop())
-    await write(frame_05_stop())
-
-    log("⏹ 全部停止")
+    clear_active_channels()
+    await flush_dirty_channels()
+    log("⏹ 全部停止；已取消所有待恢复动作")
 
 
 async def exec_cmd(c):
     command = c.get("type")
-
     try:
         if command == "stop":
             channel = c.get("channel", "all")
-
             if channel == "all":
                 await stop_all()
             elif channel in active:
-                await cancel_channel(channel, send_stop=True)
-                log(f"⏹ 停止：{channel}")
+                await cancel_channel(channel)
+                log(f"⏹ 停止目标：{channel}")
             return
-
         if command == "vibrate":
-            await start_vibrate(
-                int(c.get("mode", 1)),
-                int(c.get("level", 1)),
-                c.get("sec"),
-            )
-            return
-
-        if command == "auto":
-            await start_auto(
-                int(c.get("level", 128)),
-                c.get("sec"),
-            )
-            return
-
-        if command == "patting":
-            await start_patting(
-                int(c.get("level", 1)),
-                c.get("sec"),
-            )
-            return
-
-        if command == "thrust":
-            await start_thrust(
-                int(c.get("level", 1)),
-                c.get("sec"),
-            )
-            return
-
-        if command == "suction":
-            await start_suction(
-                int(c.get("mode", 1)),
-                int(c.get("level", 1)),
-                c.get("sec"),
-            )
-            return
-
-        if command == "heat":
-            await start_heat(
-                int(c.get("temp", 44)),
-                c.get("sec"),
-            )
-            return
-
-        log(f"⚠️ 未知指令：{c}")
-
-    except Exception as e:
-        log(f"执行失败：{type(e).__name__}: {e!r}")
+            await start_vibrate(int(c.get("mode", 1)), int(c.get("level", 1)), c.get("sec"))
+        elif command == "auto":
+            await start_auto(int(c.get("level", 128)), c.get("sec"))
+        elif command == "patting":
+            await start_patting(int(c.get("level", 1)), c.get("sec"))
+        elif command == "thrust":
+            await start_thrust(int(c.get("level", 1)), c.get("sec"))
+        elif command == "suction":
+            await start_suction(int(c.get("mode", 1)), int(c.get("level", 1)), c.get("sec"))
+        elif command == "heat":
+            await start_heat(int(c.get("temp", 44)), c.get("sec"))
+        else:
+            log(f"⚠️ 未知指令：{c}")
+    except Exception as error:
+        log(f"执行失败：{type(error).__name__}: {error!r}")
 
 
 def handle_notify(sender, data):
@@ -399,71 +389,94 @@ def handle_notify(sender, data):
         log(f"📡 吮吸指令回显：{raw.hex(' ')}")
 
 
-async def dispatch_polled_command(command, polled_client, polled_generation):
-    if not command or command.get("type") == "hello":
-        return
-    if (client_ref is not polled_client or connection_generation != polled_generation
-            or not client_ref or not client_ref.is_connected):
-        log(f"⚠️ 丢弃断线前返回的旧指令：id={command.get('id')} type={command.get('type')}")
-        return
-    log(f"📨 收到：{command}")
-    await exec_cmd(command)
+async def apply_command_batch(batch, request_generation, request_started):
+    global batch_applying, server_instance, last_command_id, synced_generation
+    if (batch.get("type") != "batch" or not isinstance(batch.get("instanceId"), str)
+            or not isinstance(batch.get("commands"), list)):
+        raise ValueError("服务器尚不支持恢复同步；等待新版服务，不恢复旧动作")
+    if server_instance != batch["instanceId"]:
+        server_instance = batch["instanceId"]
+        last_command_id = 0
+    batch_applying = True
+    try:
+        for original in batch["commands"]:
+            command_id = original.get("id", 0)
+            if command_id <= last_command_id:
+                continue
+            command = dict(original)
+            try:
+                if command.get("sec") is not None and command.get("type") != "stop":
+                    duration = valid_duration(command["sec"])
+                    queue_age = max(0, (batch["serverTime"] - command.get("createdAt", batch["serverTime"])) / 1000)
+                    remaining = duration - queue_age - max(0, time.monotonic() - request_started)
+                    if remaining <= 0:
+                        command = {"type": "stop", "channel": command["type"]}
+                        log(f"⏱ 云端指令 {command_id} 已到期，只保留停止目标")
+                    else:
+                        command["sec"] = remaining
+            except (TypeError, ValueError, OverflowError) as error:
+                log(f"⚠️ 跳过无效指令 {command_id}：{error}；继续处理后续停止指令")
+                last_command_id = command_id
+                continue
+            log(f"📨 更新目标：{command}")
+            await exec_cmd(command)
+            last_command_id = command_id
+    finally:
+        batch_applying = False
+    if (client_ref and client_ref.is_connected
+            and request_generation == connection_generation):
+        if synced_generation != connection_generation:
+            log("✅ 已同步云端最新停止/修改指令，恢复仍有效的动作；沿用原截止时间")
+        synced_generation = connection_generation
+    await flush_dirty_channels()
 
 
 async def bridge_loop():
     if not BRIDGE_URL:
-        log("⚠️ 未设置 BRIDGE_URL")
+        log("⚠️ 未设置 BRIDGE_URL，无法同步和自动恢复动作")
         return
-
     headers = {"x-bridge-secret": BRIDGE_SECRET} if BRIDGE_SECRET else {}
     last_failure_log = 0.0
     cloud_failed = False
-
     while True:
-        if not client_ref or not client_ref.is_connected:
-            await asyncio.sleep(POLL_SEC)
-            continue
         try:
-            polled_client = client_ref
-            polled_generation = connection_generation
-            # HTTP 轮询不能阻塞蓝牙通知、保活和定时停止。
-            r = await asyncio.to_thread(
-                requests.get,
-                f"{BRIDGE_URL}/toy-next",
-                headers=headers,
-                timeout=4,
-            )
-
-            r.raise_for_status()
-            c = r.json()
+            request_generation = connection_generation
+            request_started = time.monotonic()
+            params = {"batch": "1"}
+            if server_instance is not None:
+                params.update({"instance": server_instance, "ack": str(last_command_id)})
+            # 断线时仍读取最新目标和停止；不发送动作帧。未确认的批次可重取。
+            response = await asyncio.to_thread(requests.get,
+                f"{BRIDGE_URL}/toy-next", headers=headers, params=params, timeout=4)
+            response.raise_for_status()
+            batch = response.json()
             if cloud_failed:
                 log("✅ 云端轮询已恢复")
                 cloud_failed = False
-            await dispatch_polled_command(c, polled_client, polled_generation)
-
+            await apply_command_batch(batch, request_generation, request_started)
         except Exception as error:
             now = time.monotonic()
             if not cloud_failed or now - last_failure_log >= 30:
-                log(f"🌐 云端轮询失败（独立于 BLE 断线）：{type(error).__name__}: {error!r}")
+                log(f"🌐 云端轮询/同步失败：{type(error).__name__}: {error!r}")
                 last_failure_log = now
             cloud_failed = True
-
         await asyncio.sleep(POLL_SEC)
 
 
 async def keepalive_loop():
     while True:
         await asyncio.sleep(KEEPALIVE_SEC)
-
+        expire_due_channels()
+        await flush_dirty_channels()
+        if not can_start_output():
+            continue
         try:
-            if active["auto"]:
-                a = active["auto"]
-                await write(frame_04(a["level"]), active_channel="auto")
-            if active["suction"]:
-                a = active["suction"]
-                await write(frame_09(a["mode"], a["level"]), active_channel="suction")
+            for channel in ("auto", "suction"):
+                state = active[channel]
+                if state:
+                    await write(channel_frame(channel, state), active_channel=channel,
+                                expected_revision=channel_revisions[channel])
         except ConnectionError:
-            # write 已记录原因并通知连接循环；保活任务不能因此退出。
             pass
 
 

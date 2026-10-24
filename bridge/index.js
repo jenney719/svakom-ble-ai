@@ -1,4 +1,5 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 
 const app = express();
 app.use(express.json());
@@ -8,6 +9,7 @@ const BRIDGE_SECRET = process.env.BRIDGE_SECRET || "";
 
 const queue = [];
 let nextId = 1;
+const instanceId = randomUUID();
 
 const toolResult = (text) => ({
   content: [{ type: "text", text }],
@@ -51,6 +53,16 @@ app.get("/health", (req, res) => {
 app.get("/toy-next", (req, res) => {
   if (!checkAuth(req)) {
     return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  if (req.query.batch === "1") {
+    // 批次在桥接确认前不删除，HTTP 返回丢失时可以重取。
+    // 重启后的实例标识不同，旧 ack 不能删除新实例的指令。
+    const ack = Number(req.query.ack ?? 0);
+    if (req.query.instance === instanceId && Number.isSafeInteger(ack) && ack >= 0) {
+      while (queue.length && queue[0].id <= ack) queue.shift();
+    }
+    return res.json({ type: "batch", instanceId, serverTime: Date.now(), commands: [...queue] });
   }
 
   const command = queue.shift();
@@ -483,7 +495,7 @@ app.post("/mcp", async (req, res) => {
           },
           serverInfo: {
             name: "svakom-ble-ai",
-            version: "2.1.0",
+            version: "2.2.0",
           },
         },
       });
